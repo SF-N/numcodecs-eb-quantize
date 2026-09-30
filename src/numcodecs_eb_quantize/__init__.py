@@ -15,10 +15,11 @@ import numcodecs.registry
 import numpy as np
 from numcodecs.abc import Codec
 from numcodecs_combinators.abc import CodecCombinatorMixin
+from numcodecs_mask.abc import MaskAwareCodecMixin
 from typing_extensions import Buffer  # MSPV 3.12
 
 
-class ErrorBoundedQuantizeCodec(Codec, CodecCombinatorMixin):
+class ErrorBoundedQuantizeCodec(Codec, CodecCombinatorMixin, MaskAwareCodecMixin):
     """
     Meta-codec that quantises floating-point data linearly (uniformly) with an
     absolute error bound and encodes the quantisation indices with the `codec`.
@@ -37,6 +38,10 @@ class ErrorBoundedQuantizeCodec(Codec, CodecCombinatorMixin):
     to the `offset`. To preserve them, combine this codec with a masking
     meta-codec such as
     [`numcodecs_mask.MaskMetaCodec`](https://numcodecs-mask.readthedocs.io).
+    This codec implements the
+    [`MaskAwareCodecMixin`][numcodecs_mask.abc.MaskAwareCodecMixin]: masked
+    values are ignored when the quantisation grid is determined and the mask
+    is forwarded to the inner `codec` if it is mask-aware as well.
 
     Parameters
     ----------
@@ -91,6 +96,38 @@ class ErrorBoundedQuantizeCodec(Codec, CodecCombinatorMixin):
             Encoded data as a bytestring.
         """
 
+        return self._encode(buf, None)
+
+    def encode_masked(
+        self, buf: Buffer, mask: np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+    ) -> bytes:
+        """
+        Encode the data in `buf`, ignoring the values where `mask` is
+        [`True`][True].
+
+        Parameters
+        ----------
+        buf : Buffer
+            Floating-point data to be encoded. May be any object supporting
+            the new-style buffer protocol. The values at masked positions are
+            unspecified.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the data, of
+            the values that do not need to be preserved.
+
+        Returns
+        -------
+        enc : bytes
+            Encoded data as a bytestring.
+        """
+
+        return self._encode(buf, mask)
+
+    def _encode(
+        self,
+        buf: Buffer,
+        mask: None | np.ndarray[tuple[int, ...], np.dtype[np.bool]],
+    ) -> bytes:
         a = numcodecs.compat.ensure_ndarray(buf)
         dtype, shape = a.dtype, a.shape
 
@@ -98,6 +135,8 @@ class ErrorBoundedQuantizeCodec(Codec, CodecCombinatorMixin):
             raise TypeError("can only encode floating point values")
 
         is_finite = np.isfinite(a)
+        if mask is not None:
+            is_finite &= ~np.asarray(mask, dtype=np.bool).reshape(shape)
         finite = a[is_finite].astype(np.float64)
 
         offset = self._offset
@@ -132,9 +171,11 @@ class ErrorBoundedQuantizeCodec(Codec, CodecCombinatorMixin):
         else:  # pragma: no cover
             raise ValueError("quantisation indices exceed the int64 range")
 
-        encoded = numcodecs.compat.ensure_ndarray(
-            self._codec.encode(indices.astype(index_dtype))
-        )
+        if mask is not None and isinstance(self._codec, MaskAwareCodecMixin):
+            encoded_buf = self._codec.encode_masked(indices.astype(index_dtype), mask)  # type: ignore
+        else:
+            encoded_buf = self._codec.encode(indices.astype(index_dtype))
+        encoded = numcodecs.compat.ensure_ndarray(encoded_buf)
 
         # message: dtype shape offset step index-dtype
         #          encoded-dtype encoded-shape [padding] encoded
@@ -193,6 +234,44 @@ class ErrorBoundedQuantizeCodec(Codec, CodecCombinatorMixin):
             protocol.
         """
 
+        return self._decode(buf, None, out)
+
+    def decode_masked(
+        self,
+        buf: Buffer,
+        mask: np.ndarray[tuple[int, ...], np.dtype[np.bool]],
+        out: None | Buffer = None,
+    ) -> Buffer:
+        """
+        Decode the data in `buf`, which was encoded with the same `mask`.
+
+        Parameters
+        ----------
+        buf : Buffer
+            Encoded data. Must be an object representing a bytestring, e.g.
+            [`bytes`][bytes] or a 1D array of [`np.uint8`][numpy.uint8]s etc.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the decoded
+            data, that was passed to `encode_masked`.
+        out : Buffer, optional
+            Writeable buffer to store decoded data. N.B. if provided, this
+            buffer must be exactly the right size to store the decoded data.
+
+        Returns
+        -------
+        dec : Buffer
+            Decoded data. May be any object supporting the new-style buffer
+            protocol. The values at masked positions are unspecified.
+        """
+
+        return self._decode(buf, mask, out)
+
+    def _decode(
+        self,
+        buf: Buffer,
+        mask: None | np.ndarray[tuple[int, ...], np.dtype[np.bool]],
+        out: None | Buffer,
+    ) -> Buffer:
         b = numcodecs.compat.ensure_bytes(buf)
 
         b_io = BytesIO(b)
@@ -234,7 +313,10 @@ class ErrorBoundedQuantizeCodec(Codec, CodecCombinatorMixin):
         )
 
         indices = np.empty(shape, dtype=index_dtype)
-        indices_decoded = self._codec.decode(encoded, out=indices)
+        if mask is not None and isinstance(self._codec, MaskAwareCodecMixin):
+            indices_decoded = self._codec.decode_masked(encoded, mask, out=indices)  # type: ignore
+        else:
+            indices_decoded = self._codec.decode(encoded, out=indices)
         indices = numcodecs.compat.ensure_ndarray(indices_decoded).reshape(shape)
 
         decoded = (float(offset) + indices.astype(np.float64) * float(step)).astype(

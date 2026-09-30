@@ -1,4 +1,6 @@
 import numcodecs
+import numcodecs.abc
+import numcodecs.compat
 import numcodecs.registry
 import numpy as np
 import pytest
@@ -115,3 +117,51 @@ def test_index_dtype():
     assert inner.seen.dtype == np.uint8
     ErrorBoundedQuantizeCodec(codec=inner, eb=0.001).encode(data)
     assert inner.seen.dtype == np.uint16
+
+
+def test_masked():
+    from numcodecs_mask import MaskMetaCodec
+    from numcodecs_mask.abc import MaskAwareCodecMixin
+
+    from numcodecs_eb_quantize import ErrorBoundedQuantizeCodec
+
+    class Recording(numcodecs.abc.Codec, MaskAwareCodecMixin):
+        codec_id = "recording-mask-test"
+
+        def __init__(self):
+            self.mask = None
+
+        def encode(self, buf):
+            return self.encode_masked(buf, None)
+
+        def decode(self, buf, out=None):
+            return self.decode_masked(buf, None, out)
+
+        def encode_masked(self, buf, mask):
+            self.mask = None if mask is None else np.copy(mask)
+            self.seen = np.array(buf, copy=True)
+            return self.seen.tobytes()
+
+        def decode_masked(self, buf, mask, out=None):
+            return numcodecs.compat.ndarray_copy(
+                np.frombuffer(buf, dtype=self.seen.dtype).reshape(self.seen.shape), out
+            )
+
+    rng = np.random.default_rng(7)
+    data = rng.normal(size=(20, 30))
+    mask = rng.random(data.shape) < 0.3
+    data[mask] = np.nan
+
+    inner = Recording()
+    codec = MaskMetaCodec(
+        mask=np.nan,
+        codec=ErrorBoundedQuantizeCodec(codec=inner, eb=0.01),
+        bitmap_codec=dict(id="packbits"),
+    )
+    decoded = np.asarray(codec.decode(codec.encode(data)))
+    # the mask reached the inner codec through the quantiser
+    np.testing.assert_array_equal(inner.mask, mask)
+    np.testing.assert_array_equal(np.isnan(decoded), mask)
+    assert np.all(np.abs(decoded[~mask] - data[~mask]) <= 0.01)
+    # the quantisation indices (of the unmasked values) reached the inner codec
+    assert inner.seen.shape == data.shape and inner.seen.dtype.kind == "u"
